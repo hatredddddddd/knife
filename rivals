@@ -1,0 +1,710 @@
+-- Rivals Void Knife (Matcha)
+-- F5: park yourself off to one side (up / down / left / right) of where you stand,
+--     jittering to random spots inside a square so you're hard to hit.
+-- F6: press once -> snap behind the nearest enemy, knife them, snap back out.
+-- Height / depth limits keep you from going past the map's kill height.
+
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local LP = Players.LocalPlayer
+
+local VOID_KEY = 0x74 -- F5 (change to any Windows VK code)
+local STAB_KEY = 0x75 -- F6
+
+-- Players that are never targeted (lowercase names)
+local WHITELIST = {
+    ["banned_my1account"] = true,
+}
+
+local voidActive = false
+local wasVoidDown = false
+local wasStabDown = false
+local lastCycle = 0
+local lastJitter = 0
+local anchor, anchorCF, anchorRight, anchorFwd
+local viewPos      -- where the camera is pinned in attacker mode
+local inStab = false
+
+-- Defaults, also used before the menu has rendered for the first time
+local DEFAULTS = {
+    vd_enabled = false,
+    vd_dir = 3,          -- 0 Up, 1 Left, 2 Right, 3 All (random); never goes down
+    vd_dist = 25,        -- studs away from where you started
+    vd_range = 8,        -- half-size of the random square (studs)
+    vd_interval = 0,     -- ms between random position changes (0 = every frame)
+    vd_maxheight = 40,   -- never go higher than this above the anchor
+    vd_maxrange = 200,   -- how far from the anchor a target can be
+    vd_attack = 0,       -- 0 = M2 (backstab), 1 = M1 (slash)
+    vd_behind = 2.0,
+    vd_settle = 60,
+    vd_attempts = 2,
+    vd_retry = 150,
+    vd_hold = 250,
+    vd_cooldown = 700,
+    vd_stayview = true,  -- attacker mode: camera stays put while the body moves
+    vd_aim = true,
+    vd_yawonly = true,   -- camera lock-on turns left/right only, never up/down
+    vd_holdstab = true,  -- holding F6 repeats the stab instead of one stab per press
+    vd_pressms = 60,     -- how long each M2 press is held down
+    vd_restoreview = true,
+    vd_team = true,
+    vd_walls = true,     -- wall protection (don't pick spots behind / inside walls)
+    vd_edge = true,      -- map-edge protection (don't pick spots with no floor below)
+    vd_auto = false,     -- stab automatically instead of waiting for F6
+}
+
+local function get(id)
+    local ok, v = pcall(UI.GetValue, id)
+    if ok and v ~= nil then return v end
+    return DEFAULTS[id]
+end
+
+-- ===== Config save / load =====
+local CONFIG_FILE = "rivals_voidknife.json"
+local lastSaved = ""
+local lastSaveCheck = 0
+
+local function loadConfig()
+    local ok, data = pcall(function()
+        if isfile(CONFIG_FILE) then
+            return HttpService:JSONDecode(readfile(CONFIG_FILE))
+        end
+    end)
+    if ok and type(data) == "table" then
+        for id, v in pairs(data) do
+            if DEFAULTS[id] ~= nil and type(v) == type(DEFAULTS[id]) then
+                DEFAULTS[id] = v
+            end
+        end
+        print("VoidKnife: config loaded")
+    end
+end
+
+local function saveConfig()
+    local data = {}
+    for id in pairs(DEFAULTS) do
+        data[id] = get(id)
+    end
+    local ok, enc = pcall(function() return HttpService:JSONEncode(data) end)
+    if ok and enc ~= lastSaved then
+        if pcall(writefile, CONFIG_FILE, enc) then
+            lastSaved = enc
+        end
+    end
+end
+
+loadConfig()
+
+-- ===== Menu =====
+UI.AddTab("Void Knife", function(tab)
+    local sec = tab:Section("Void Knife", "Left")
+    sec:Toggle("vd_enabled", "Enabled", DEFAULTS.vd_enabled)
+    sec:Text("F5 = void on/off, F6 = stab once")
+    sec:Combo("vd_dir", "Void direction", {"Up", "Left", "Right", "All (random)"}, DEFAULTS.vd_dir)
+    sec:SliderInt("vd_dist", "Distance from start (studs)", 5, 150, DEFAULTS.vd_dist)
+    sec:SliderInt("vd_range", "Random square size (studs)", 0, 40, DEFAULTS.vd_range)
+    sec:SliderInt("vd_interval", "Position change every (ms, 0 = every frame)", 0, 300, DEFAULTS.vd_interval)
+    sec:SliderInt("vd_maxheight", "Max height above start", 0, 150, DEFAULTS.vd_maxheight)
+    sec:SliderInt("vd_maxrange", "Target range from start", 20, 600, DEFAULTS.vd_maxrange)
+    sec:Combo("vd_attack", "Knife attack", {"M2 (backstab)", "M1 (slash)"}, DEFAULTS.vd_attack)
+    sec:SliderInt("vd_pressms", "M2 press length (ms)", 10, 300, DEFAULTS.vd_pressms)
+    sec:SliderFloat("vd_behind", "Distance behind target", 1, 6, DEFAULTS.vd_behind, "%.1f")
+    sec:SliderInt("vd_settle", "Settle after teleport (ms)", 0, 400, DEFAULTS.vd_settle)
+    sec:SliderInt("vd_attempts", "Attack attempts per stab", 1, 5, DEFAULTS.vd_attempts)
+    sec:SliderInt("vd_retry", "Gap between attempts (ms)", 50, 500, DEFAULTS.vd_retry)
+    sec:SliderInt("vd_hold", "Hold before leaving (ms)", 20, 800, DEFAULTS.vd_hold)
+    sec:SliderInt("vd_cooldown", "Cooldown between stabs (ms)", 0, 3000, DEFAULTS.vd_cooldown)
+    sec:Toggle("vd_holdstab", "Hold F6 = keep teleporting + stabbing", DEFAULTS.vd_holdstab)
+    sec:Toggle("vd_stayview", "Attacker mode (camera stays still)", DEFAULTS.vd_stayview)
+    sec:Toggle("vd_aim", "Auto camera (lock on their torso)", DEFAULTS.vd_aim)
+    sec:Toggle("vd_yawonly", "Lock-on left/right only (no up/down)", DEFAULTS.vd_yawonly)
+    sec:Toggle("vd_restoreview", "Restore camera after", DEFAULTS.vd_restoreview)
+    sec:Toggle("vd_team", "Team check (skip teammates)", DEFAULTS.vd_team)
+    sec:Toggle("vd_walls", "Wall protection", DEFAULTS.vd_walls)
+    sec:Toggle("vd_edge", "Map edge protection", DEFAULTS.vd_edge)
+    sec:Toggle("vd_auto", "Auto stab (no key needed)", DEFAULTS.vd_auto)
+    sec:Button("Save config now", function()
+        saveConfig()
+        notify("Config saved", "Void Knife", 2)
+    end)
+end)
+
+-- ===== Helpers =====
+local function getRoot(plr)
+    local char = plr and plr.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChild("Humanoid")
+    if hrp and hum and hum.Health > 0 then
+        return hrp, hum
+    end
+    return nil
+end
+
+-- write a CFrame to a part; fall back to Position if CFrame isn't writable
+local function setCF(part, cf)
+    local ok = pcall(function() part.CFrame = cf end)
+    if not ok then
+        pcall(function() part.Position = cf.Position end)
+    end
+end
+
+-- move a part to a position but keep its own rotation
+local function moveTo(part, pos)
+    local ok, cf = pcall(function()
+        local _, _, _, r00, r01, r02, r10, r11, r12, r20, r21, r22 = part.CFrame:GetComponents()
+        return CFrame.new(pos.X, pos.Y, pos.Z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
+    end)
+    if ok and cf then
+        setCF(part, cf)
+    else
+        pcall(function() part.Position = pos end)
+    end
+end
+
+local function nearestTarget(center, range)
+    local best, bestDist
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local sameTeam = false
+        if get("vd_team") then
+            local ok, same = pcall(function()
+                return plr.Team ~= nil and LP.Team ~= nil and plr.Team == LP.Team
+            end)
+            sameTeam = ok and same
+        end
+        if plr ~= LP and not sameTeam and not WHITELIST[string.lower(plr.Name)] then
+            local hrp = getRoot(plr)
+            if hrp then
+                local d = (hrp.Position - center).Magnitude
+                if d <= range and (not bestDist or d < bestDist) then
+                    best, bestDist = hrp, d
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function targetAlive(target)
+    local ok, alive = pcall(function()
+        local hum = target.Parent and target.Parent:FindFirstChild("Humanoid")
+        return hum ~= nil and hum.Health > 0
+    end)
+    return ok and alive
+end
+
+-- Wall protection: is the straight path from `from` to `to` free of walls?
+-- Player / character bodies don't count as walls (the ray steps through them);
+-- anything solid in between does, so we never pick a spot behind or inside a wall.
+local function clearPath(from, to)
+    local origin = from
+    for _ = 1, 6 do
+        local dir = to - origin
+        if dir.Magnitude < 0.5 then return true end
+        local ok, res = pcall(function() return workspace:Raycast(origin, dir) end)
+        if not ok then return true end -- raycasts unavailable: can't check, allow
+        if not res then return true end -- nothing in the way
+        local inst = res.Instance
+        local passThrough = false
+        pcall(function()
+            -- not solid (invisible hitboxes, effects): doesn't count as a wall
+            if inst.CanCollide == false then passThrough = true end
+            -- any player's body or gear (accessories, tools, viewmodel): not a wall
+            for _, plr in ipairs(Players:GetPlayers()) do
+                local char = plr.Character
+                if char and inst:IsDescendantOf(char) then
+                    passThrough = true
+                    break
+                end
+            end
+            local par = inst.Parent
+            if par ~= nil and par:FindFirstChild("Humanoid") ~= nil then
+                passThrough = true
+            end
+        end)
+        if passThrough then
+            origin = res.Position + dir.Unit * 0.3
+        else
+            return false
+        end
+    end
+    return false
+end
+
+-- Which way is the target facing, flattened onto the ground? (Head first, since
+-- some rigs have a rotated root part.)
+local function targetFacing(target)
+    local char = target.Parent
+    local parts = { char and char:FindFirstChild("Head"), target }
+    for _, part in ipairs(parts) do
+        local ok, flat = pcall(function()
+            local look = part.CFrame.LookVector
+            return Vector3.new(look.X, 0, look.Z)
+        end)
+        if ok and flat and flat.Magnitude > 0.5 then
+            return flat.Unit
+        end
+    end
+    local ok, vel = pcall(function() return target.AssemblyLinearVelocity end)
+    if ok and vel then
+        local flat = Vector3.new(vel.X, 0, vel.Z)
+        if flat.Magnitude > 1 then return flat.Unit end
+    end
+    return nil
+end
+
+local function behindPos(target)
+    local base = target.Position
+    local facing = targetFacing(target)
+    if facing then
+        -- if their back is against a wall, stand closer instead of inside it
+        for _, f in ipairs({ 1, 0.6, 0.3 }) do
+            local pos = base - facing * (get("vd_behind") * f)
+            if clearPath(base, pos) then return pos end
+        end
+    end
+    return base
+end
+
+-- ===== Camera aim (auto-calibrating, no sensitivity setting) =====
+local learnedPx = 250
+
+-- fromBody: aim from where the BODY is instead of where the camera is, so in
+-- attacker mode the camera turns the way the body should be attacking
+local function aimErrors(targetHrp, fromBody)
+    local cf = workspace.CurrentCamera.CFrame
+    local origin = cf.Position
+    if fromBody then
+        local me = getRoot(LP)
+        if me then origin = me.Position end
+    end
+    -- aim at their torso (the root part sits in the middle of it)
+    local dir = (targetHrp.Position - origin).Unit
+    local x = dir:Dot(cf.RightVector)
+    local y = dir:Dot(cf.UpVector)
+    local z = dir:Dot(cf.LookVector)
+    local yawErr = math.atan2(x, z)
+    local pitchErr = math.atan2(y, math.sqrt(x * x + z * z))
+    return yawErr, pitchErr
+end
+
+local function aimAt(targetHrp, fromBody)
+    local totalX, totalY = 0, 0
+    local prevYaw, prevPitch, prevDx, prevDy
+
+    for _ = 1, 25 do
+        local yawErr, pitchErr = aimErrors(targetHrp, fromBody)
+
+        if prevDx then
+            local est
+            local turnedYaw = prevYaw - yawErr
+            local turnedPitch = prevPitch - pitchErr
+            if math.abs(prevDx) >= math.abs(prevDy) and math.abs(prevDx) >= 4
+                and math.abs(prevYaw) < 2.5 and math.abs(turnedYaw) > 0.002
+                and turnedYaw * prevDx > 0 then
+                est = math.abs(prevDx / turnedYaw)
+            elseif math.abs(prevDy) >= 4 and math.abs(turnedPitch) > 0.002
+                and turnedPitch * (-prevDy) > 0 then
+                est = math.abs(prevDy / turnedPitch)
+            end
+            if est then
+                learnedPx = math.clamp(learnedPx * 0.5 + est * 0.5, 30, 6000)
+            end
+        end
+
+        -- horizontal-only: turn left/right, never move the view up or down
+        local yawOnly = get("vd_yawonly")
+        local pitchOk = yawOnly or math.abs(pitchErr) < 0.04
+        if math.abs(yawErr) < 0.04 and pitchOk then break end
+
+        local dx = math.floor(yawErr * learnedPx * 0.9)
+        local dy = yawOnly and 0 or math.floor(-pitchErr * learnedPx * 0.9)
+        if dx == 0 and dy == 0 then break end
+
+        prevYaw, prevPitch, prevDx, prevDy = yawErr, pitchErr, dx, dy
+        mousemoverel(dx, dy)
+        totalX, totalY = totalX + dx, totalY + dy
+        wait(0.015)
+    end
+
+    return totalX, totalY
+end
+
+-- Lock-on: one aim correction per call. Called every frame while stabbing so the
+-- camera stays locked on their back even as they move, instead of aiming once.
+-- Returns the pixels moved (so the view can be restored afterwards).
+local lockPrev -- last move, used to keep the sensitivity estimate up to date
+
+local function lockStep(targetHrp, fromBody)
+    local yawErr, pitchErr = aimErrors(targetHrp, fromBody)
+
+    if lockPrev then
+        local est
+        local turnedYaw = lockPrev.yaw - yawErr
+        local turnedPitch = lockPrev.pitch - pitchErr
+        if math.abs(lockPrev.dx) >= math.abs(lockPrev.dy) and math.abs(lockPrev.dx) >= 4
+            and math.abs(lockPrev.yaw) < 2.5 and math.abs(turnedYaw) > 0.002
+            and turnedYaw * lockPrev.dx > 0 then
+            est = math.abs(lockPrev.dx / turnedYaw)
+        elseif math.abs(lockPrev.dy) >= 4 and math.abs(turnedPitch) > 0.002
+            and turnedPitch * (-lockPrev.dy) > 0 then
+            est = math.abs(lockPrev.dy / turnedPitch)
+        end
+        if est then
+            learnedPx = math.clamp(learnedPx * 0.5 + est * 0.5, 30, 6000)
+        end
+        lockPrev = nil
+    end
+
+    -- horizontal-only: turn left/right, never move the view up or down
+    local yawOnly = get("vd_yawonly")
+    local pitchOk = yawOnly or math.abs(pitchErr) < 0.015
+    if math.abs(yawErr) < 0.015 and pitchOk then return 0, 0 end
+
+    local dx = math.floor(yawErr * learnedPx * 0.95)
+    local dy = yawOnly and 0 or math.floor(-pitchErr * learnedPx * 0.95)
+    if dx == 0 and dy == 0 then return 0, 0 end
+
+    lockPrev = { yaw = yawErr, pitch = pitchErr, dx = dx, dy = dy }
+    mousemoverel(dx, dy)
+    return dx, dy
+end
+
+-- ===== Void movement =====
+-- A random spot on the chosen side of the anchor, inside a square, with the
+-- height / depth limits applied so you never pass the kill height.
+local groundY -- height of the floor under where you started
+
+-- What's the floor under this point? Returns its position, nil if there is none
+-- (we're past the edge of the map), or "unknown" if raycasts don't work here.
+-- Skips our own character's parts so we hit the real floor.
+local function groundBelow(pos)
+    local origin = pos + Vector3.new(0, 1, 0)
+    local myChar = LP.Character
+    for _ = 1, 6 do
+        local ok, res = pcall(function()
+            return workspace:Raycast(origin, Vector3.new(0, -500, 0))
+        end)
+        if not ok then return "unknown" end
+        if not res then return nil end
+        if myChar and res.Instance:IsDescendantOf(myChar) then
+            origin = res.Position + Vector3.new(0, -0.2, 0)
+        else
+            return res.Position
+        end
+    end
+    return nil
+end
+
+-- Are we still over the playable map? Out of the map = no floor below, or a
+-- floor far lower than where we started (a pit / the void under the map).
+local function overMap(pos)
+    local g = groundBelow(pos)
+    if g == "unknown" then return true end
+    if g == nil then return false end
+    if groundY and g.Y < groundY - 40 then return false end
+    return true
+end
+
+-- one random candidate spot (not yet checked against the map)
+local function candidateSpot()
+    local dir = get("vd_dir")
+    local dist = get("vd_dist")
+    local j = get("vd_range")
+    local a = (math.random() * 2 - 1) * j
+    local b = (math.random() * 2 - 1) * j
+
+    -- Never goes below where you started: height offsets are 0 or positive only.
+    local off
+    if dir >= 3 then      -- All directions (up / left / right / forward / back), never down
+        off = Vector3.new((math.random() * 2 - 1) * dist,
+                          math.random() * dist,
+                          (math.random() * 2 - 1) * dist)
+    elseif dir == 0 then  -- Up: square in the ground plane
+        off = Vector3.new(a, dist, b)
+    elseif dir == 1 then  -- Left: square in the forward/vertical plane
+        off = anchorRight * -dist + anchorFwd * a + Vector3.new(0, math.abs(b), 0)
+    else                  -- Right
+        off = anchorRight * dist + anchorFwd * a + Vector3.new(0, math.abs(b), 0)
+    end
+
+    local dy = math.clamp(off.Y, 0, get("vd_maxheight"))
+    return Vector3.new(anchor.X + off.X, anchor.Y + dy, anchor.Z + off.Z)
+end
+
+-- A random spot that is guaranteed to be over the map. Tries a handful of
+-- candidates and skips any that would leave the map; if none is safe it stays put.
+local edgeRejects, wallRejects, lastWarn = 0, 0, 0
+
+local function voidSpot()
+    for _ = 1, 10 do
+        local p = candidateSpot()
+        if get("vd_edge") and not overMap(p) then
+            edgeRejects = edgeRejects + 1
+        elseif get("vd_walls") and not clearPath(anchor, p) then
+            wallRejects = wallRejects + 1
+        else
+            return p
+        end
+    end
+    -- nothing passed: stay put, and say which check is rejecting everything
+    if tick() - lastWarn > 3 then
+        lastWarn = tick()
+        warn(string.format("VoidKnife: no safe spot (map-edge rejects %d, wall rejects %d). "
+            .. "Turn off the check that is rejecting everything.", edgeRejects, wallRejects))
+        edgeRejects, wallRejects = 0, 0
+    end
+    return anchor
+end
+
+local function toggleVoid()
+    local me = getRoot(LP)
+    if not voidActive then
+        if not me then return end
+        anchor = me.Position
+        anchorCF = me.CFrame
+        local cf = workspace.CurrentCamera.CFrame
+        local r = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
+        local f = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+        anchorRight = r.Magnitude > 0.01 and r.Unit or Vector3.new(1, 0, 0)
+        anchorFwd = f.Magnitude > 0.01 and f.Unit or Vector3.new(0, 0, -1)
+        viewPos = workspace.CurrentCamera.CFrame.Position
+        local g = groundBelow(anchor)
+        groundY = (type(g) ~= "string" and g) and g.Y or nil
+        voidActive = true
+        notify("Void ON", "Void Knife", 1.5)
+    else
+        voidActive = false
+        if not inStab then viewPos = nil end
+        if me and anchorCF then
+            setCF(me, anchorCF)
+        end
+        notify("Void OFF", "Void Knife", 1.5)
+    end
+end
+
+-- ===== Attacker mode: pin the camera in place =====
+-- The body teleports around, but the camera keeps its position (so your POV stays
+-- like a normal player's). Only the position is overridden; you still look around
+-- with the mouse because the camera's own rotation is kept.
+local function holdView()
+    local cam = workspace.CurrentCamera
+    local _, _, _, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cam.CFrame:GetComponents()
+    pcall(function()
+        cam.CFrame = CFrame.new(viewPos.X, viewPos.Y, viewPos.Z,
+            r00, r01, r02, r10, r11, r12, r20, r21, r22)
+    end)
+end
+
+task.spawn(function()
+    while true do
+        task.wait()
+        if viewPos and get("vd_stayview") and (voidActive or inStab) then
+            pcall(holdView)
+        end
+    end
+end)
+
+-- upright CFrame at pos with the body looking toward lookAtPos (horizontal only)
+local function facingCF(pos, lookAtPos)
+    local d = Vector3.new(lookAtPos.X - pos.X, 0, lookAtPos.Z - pos.Z)
+    if d.Magnitude < 0.01 then d = Vector3.new(0, 0, -1) end
+    local look = d.Unit
+    local up = Vector3.new(0, 1, 0)
+    local right = look:Cross(up).Unit
+    local back = -look
+    return CFrame.new(pos.X, pos.Y, pos.Z,
+        right.X, up.X, back.X,
+        right.Y, up.Y, back.Y,
+        right.Z, up.Z, back.Z)
+end
+
+-- ===== The stab =====
+local function attack()
+    pcall(setrobloxinput, true) -- make sure Matcha's input is being sent to the game
+    local isM2 = get("vd_attack") == 0
+    local down = isM2 and mouse2press or mouse1press
+    local up = isM2 and mouse2release or mouse1release
+    pcall(down)
+    wait(get("vd_pressms") / 1000)
+    pcall(up) -- always released, even if something above failed
+    print("VoidKnife: " .. (isM2 and "M2" or "M1") .. " pressed")
+end
+
+local pinSession -- the background "keep teleporting behind them" loop of the current stab
+
+local function doStab(target)
+    local me0 = getRoot(LP)
+    if not me0 then return end
+    local origCF = me0.CFrame
+    local movedX, movedY = 0, 0
+
+    local pingMs = 0
+    pcall(function() pingMs = tonumber(GetPingValue()) or 0 end)
+
+    -- keep us glued to their back while they move
+    local function pin()
+        local me = getRoot(LP)
+        if not me then return end
+        local pos = behindPos(target)
+        if get("vd_stayview") then
+            -- attacker mode: the body turns toward them, the camera stays put
+            setCF(me, facingCF(pos, target.Position))
+        else
+            moveTo(me, pos)
+        end
+        pcall(function() me.AssemblyLinearVelocity = Vector3.zero end)
+    end
+    local aimCam = get("vd_aim")
+    local fromBody = get("vd_stayview")
+
+    -- 1) snap behind them, then keep re-teleporting behind them every frame in the
+    -- background until we leave (through the settle, aiming, every press and the
+    -- hold), so the hit lands even while they move
+    local session = { on = true }
+    pinSession = session
+    pin()
+    task.spawn(function()
+        while session.on do
+            pcall(pin)
+            task.wait()
+        end
+    end)
+    wait(get("vd_settle") / 1000 + pingMs / 2000)
+
+    -- 2) look at them
+    pin()
+    if aimCam then
+        local okA, dx, dy = pcall(aimAt, target, fromBody)
+        if okA then movedX, movedY = movedX + dx, movedY + dy end
+    end
+
+    -- 3) knife them (retry in case a press is dropped), staying pinned
+    local attempts = get("vd_attempts")
+    local retryGap = get("vd_retry") / 1000
+    local holdEnd = tick() + get("vd_hold") / 1000 + pingMs / 1000
+    local fired = 0
+    local nextFire = tick()
+
+    -- (always presses at least once, even if the hold time already ran out)
+    while tick() < holdEnd or fired < 1 do
+        if fired > 0 and not targetAlive(target) then break end
+        -- lock-on: keep the camera on their back every frame, not just once.
+        -- Wrapped so an aiming error can never skip the M2 press below.
+        if aimCam then
+            local okL, dx, dy = pcall(lockStep, target, fromBody)
+            if okL then movedX, movedY = movedX + dx, movedY + dy end
+        end
+        if fired < attempts and tick() >= nextFire then
+            attack()
+            fired = fired + 1
+            nextFire = tick() + retryGap
+            -- stay behind them until this swing has had time to land
+            holdEnd = math.max(holdEnd, tick() + get("vd_hold") / 1000 + pingMs / 1000)
+        end
+        wait(0.015)
+    end
+
+    -- stop re-teleporting behind them, then snap back
+    session.on = false
+
+    -- 4) go back out: the void loop takes over next frame; otherwise restore
+    if not voidActive then
+        local me = getRoot(LP)
+        if me then setCF(me, origCF) end
+    end
+
+    -- 5) undo the camera movement
+    if get("vd_restoreview") and (movedX ~= 0 or movedY ~= 0) then
+        mousemoverel(-movedX, -movedY)
+    end
+end
+
+local function stabCycle(target)
+    inStab = true
+    if get("vd_stayview") and not viewPos then
+        viewPos = workspace.CurrentCamera.CFrame.Position
+    end
+    local ok, err = pcall(doStab, target)
+    if pinSession then pinSession.on = false end -- never leave the pin loop running
+    inStab = false
+    if not voidActive then viewPos = nil end
+    if not ok then warn("VoidKnife stab: " .. tostring(err)) end
+end
+
+-- ===== Main loop =====
+local function step()
+    if tick() - lastSaveCheck > 2 then
+        lastSaveCheck = tick()
+        saveConfig()
+    end
+
+    if not get("vd_enabled") then return end
+    if not isrbxactive() then return end
+
+    local vDown = iskeypressed(VOID_KEY)
+    local sDown = iskeypressed(STAB_KEY)
+    local voidPressed = vDown and not wasVoidDown
+    local stabEdge = sDown and not wasStabDown
+    -- hold F6 to keep teleporting behind them and stabbing over and over
+    local stabPressed = sDown and (get("vd_holdstab") or stabEdge)
+    wasVoidDown, wasStabDown = vDown, sDown
+
+    if voidPressed then toggleVoid() end
+
+    local me = getRoot(LP)
+    if not me then
+        voidActive = false -- died / respawning: drop the void state
+        return
+    end
+
+    -- Safety while in the void: never let gravity build up, and if we ever end up
+    -- outside the height/depth limits (fell, or a write was dropped), put us back
+    -- inside them right away instead of falling into the kill zone.
+    if voidActive and anchor then
+        pcall(function() me.AssemblyLinearVelocity = Vector3.zero end)
+        local p = me.Position
+        local floorY = anchor.Y
+        local ceilY = anchor.Y + get("vd_maxheight")
+        if p.Y < floorY - 3 or p.Y > ceilY + 3 or (get("vd_edge") and not overMap(p)) then
+            moveTo(me, voidSpot())
+            lastJitter = tick()
+        end
+    end
+
+    -- stab (key press, or automatically)
+    if (stabPressed or get("vd_auto"))
+        and (tick() - lastCycle) * 1000 >= get("vd_cooldown") then
+        local center = (voidActive and anchor) or me.Position
+        local target = nearestTarget(center, get("vd_maxrange"))
+        if target then
+            stabCycle(target)
+            lastCycle = tick()
+            return
+        elseif stabEdge then
+            notify("No target in range", "Void Knife", 1)
+        end
+    end
+
+    -- keep hopping around the random square
+    if voidActive and (tick() - lastJitter) * 1000 >= get("vd_interval") then
+        lastJitter = tick()
+        moveTo(me, voidSpot())
+        pcall(function() me.AssemblyLinearVelocity = Vector3.zero end)
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait()
+        local ok, err = pcall(step)
+        if not ok then
+            warn("VoidKnife: " .. tostring(err))
+            wait(1)
+        end
+    end
+end)
+
+pcall(setrobloxinput, true) -- make sure Matcha's mouse input reaches the game
+
+notify("Void Knife loaded. Open the tab, F5 = void, F6 = stab.", "Rivals", 4)
